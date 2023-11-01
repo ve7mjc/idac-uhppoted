@@ -1,1 +1,19 @@
 
+version: '3'
+
+services:
+
+  idac-uhppoted:
+    container_name: idac-uhppoted
+    hostname: idac-uhppoted
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - data:/data
+      - ./config.yml:/config.yml
+
+volumes:
+  data:

@@ -1,0 +1,35 @@
+# Sample Configuration File
+#
+# MQTT and UHPPOTED.mqtt_topic_root can be specified by environment variables
+# eg. mqtt.host = MQTT_HOST, uhppoted.mqtt_topic_root = UHPPOTED_MQTT_TOPIC_ROOT
+
+uhppoted:
+  mqtt_topic_root: # Optional; defaults to "uhppoted/gateway"
+
+  # list of devices, with name/label of controller
+  # one device is required
+  devices: # one required
+    controller_main:
+      device_id: 12345
+    controller_2:
+      device_id: 98765
+
+mqtt:
+  host: mqtt.somehost.com
+  username: mqttuser
+  password: mqttpassword
+  port: 1883
+
+#
+# minimal example w/ MQTT_PASSWORD set in environment variable or specified
+# in ./.env file
+#
+
+uhppoted:
+  devices:
+    controller_main:
+      device_id: 12345
+
+mqtt:
+  host: mqtt.somehost.com
+  username: mqttuser
