@@ -37,7 +37,14 @@ class UhppoteServerConfiguration:
 
 
 @dataclass
+class MembershipPortalConfiguration:
+    url_get_tokens_list: str
+    url_put_token_events: str
+
+
+@dataclass
 class Configuration:
+    membership_portal: MembershipPortalConfiguration
     mqtt: MqttConfiguration
     uhppoted: UhppoteServerConfiguration
     devices: list[UhppoteDeviceConfiguration] = field(default_factory=list)
@@ -95,7 +102,22 @@ def get_config() -> Configuration:
 
     builder = ConfigBuilder()
 
-    builder.add_yaml("./config.yml")
+    # search for config.yml or something similar
+    config_paths: list[str] = [
+        './config.yml',
+        './config/config.yml',
+        '/config/config.yml'
+    ]
+
+    found_config: bool = False
+    for config_path in config_paths:
+        if os.path.exists(config_path):
+            logger.debug("found config file at '%s'", config_path)
+            builder.add_yaml(config_path)
+            found_config = True
+
+    if not found_config:
+        raise FileNotFoundError("a suitable config.yml was not found!")
 
     cfg = {}
 
@@ -107,6 +129,12 @@ def get_config() -> Configuration:
     cfg['uhppoted'] = {}
     cfg['uhppoted']['mqtt_topic_root'] = \
         builder.get_key('uhppoted.mqtt_topic_root', DEFAULT_UHPPOTED_MQTT_TOPIC_ROOT)
+
+    cfg['membership_portal'] = {}
+    cfg['membership_portal']['url_get_tokens_list'] = \
+        builder.get_key('membership_portal.url_get_tokens_list')
+    cfg['membership_portal']['url_put_token_events'] = \
+        builder.get_key('membership_portal.url_put_token_events')
 
     cfg['mqtt'] = {}
     cfg['mqtt']['host'] = builder.get_key('mqtt.host')

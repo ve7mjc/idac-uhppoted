@@ -20,6 +20,10 @@ mqtt:
   password: mqttpassword
   port: 1883
 
+membership_portal:
+  url_get_tokens_list: https://<url for GET token list>
+  url_put_token_events: https://<url for POST token event>
+
 #
 # minimal example w/ MQTT_PASSWORD set in environment variable or specified
 # in ./.env file

@@ -1,19 +1,19 @@
-from config import get_config, Configuration
+from configuration import get_config, Configuration
+from idac import MembershipPortalClient
 from schema import Request
 
 # from typing import Optional
 from dataclasses import asdict
 import logging
+from logging.handlers import RotatingFileHandler
 from time import sleep
+import os
 import json
 
 import paho.mqtt.client as mqtt
 
-
+# establish a logger here in the possibility this is used as as module
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logging.basicConfig()
-
 
 # MQTT Return Codes and their description
 MQTT_RC: dict[int, str] = {
@@ -37,12 +37,18 @@ class IdacAdapter:
 
     config: Configuration
 
+    portal: MembershipPortalClient
+
     def __init__(self, config: Configuration) -> None:
 
         self.config = config
 
         if len(self.config.uhppoted.devices) == 0:
-            raise Exception("no UHPPOTED devices configured!")
+            raise Exception("no UHPPOTE devices configured!")
+
+        self.portal = MembershipPortalClient(
+            url_get_tokens_list=self.config.membership_portal.url_get_tokens_list,
+            url_put_token_events=self.config.membership_portal.url_put_token_events)
 
         self.last_request = 0
 
@@ -57,6 +63,11 @@ class IdacAdapter:
         self.mqttc.connect(self.config.mqtt.host, self.config.mqtt.port, 60)
 
         self.mqttc.loop_start()
+
+        tokens_list = self.portal.get_tokens_list()
+
+        for token in tokens_list:
+            print(token)
 
         # run for 5 seconds then peace out
         sleep(5)
@@ -92,6 +103,7 @@ class IdacAdapter:
 
     def generate_request(self) -> Request:
         request_id = f'idac-r{self.last_request + 1}'
+        # TODO: only looking at first device right now
         return Request(
             request_id=request_id,
             client_id=self.config.uhppoted.client_id,
@@ -101,5 +113,38 @@ class IdacAdapter:
 
 if __name__ == '__main__':
 
-    config = get_config()
+    #
+    # Configure logging
+    #
+
+    logs_path = os.environ.get("LOGS_PATH", "./logs")
+    if not os.path.exists(logs_path):
+        os.mkdir(logs_path)
+
+    log_file = os.path.join(logs_path, 'idac-uhppote.log')
+
+    # 5 MB per file, keep 5 old copies
+    file_handler = RotatingFileHandler(log_file, maxBytes=1024 * 1024 * 5,
+                                       backupCount=5)
+
+    console_handler = logging.StreamHandler()
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # set levels
+    logger.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.WARNING)
+    file_handler.setLevel(logging.DEBUG)
+
+    try:
+        config = get_config()
+    except FileNotFoundError:
+        print("cannot locate config file!")
+        sleep(120)
+        exit(1)
+
     idac = IdacAdapter(config)

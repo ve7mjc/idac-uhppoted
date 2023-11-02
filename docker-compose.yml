@@ -12,8 +12,9 @@ services:
     env_file:
       - .env
     volumes:
-      - data:/data
-      - ./config.yml:/config.yml
+      - ./config:/app/config
+      - ./cache:/app/cache
+      - ./logs:/app/logs
 
-volumes:
-  data:
+# volumes:
+#   data:

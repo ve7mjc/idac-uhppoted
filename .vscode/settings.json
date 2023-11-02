@@ -1,0 +1,12 @@
+{
+    "python.pythonPath": "venv/bin/python",
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/.git": true,
+    },
+    "python.autoComplete.extraPaths": ["./"],
+    "files.trimTrailingWhitespace": true,
+    "python.analysis.extraPaths": [
+      "./"
+    ]
+}
