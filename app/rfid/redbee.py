@@ -21,6 +21,8 @@ The decimal represented bytes are also bit mirrored
 
 from .utils import hex_string_to_bytes, bit_mirror_bytes, em41xx_to_wiegand34_int
 
+import re
+
 
 def redbee_code_fix(redbee_tag: list[bytes]) -> list[bytes]:
 
@@ -39,3 +41,7 @@ def redbee_hex_str_to_wiegand34(redbee_str: str) -> int:
     em41xx = redbee_code_fix(hex_string_to_bytes(redbee_str))
 
     return em41xx_to_wiegand34_int(em41xx)
+
+
+def legal_redbee_code(code: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F]{10}", code))

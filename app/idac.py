@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 
+from rfid.redbee import legal_redbee_code
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,11 @@ def process_v1_token_list(content: str) -> list[LegacyToken]:
             status=LegacyTokenStatus(int(parts[3])),
             member_label=parts[4]
         )
-        tokens.append(token)
+
+        # we are going to drop tokens that have been mutilated in the database
+        # for some reason ('', 'xxx', 'xxxxxx')
+        if legal_redbee_code(token.code):
+            tokens.append(token)
 
     return tokens
 
