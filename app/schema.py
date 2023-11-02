@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
-class Request:
-    request_id: str
-    client_id: str
+class UhppotedRequest:
     device_id: str
+    topic: str
+    payload: dict
+    request_id: Optional[int] = None

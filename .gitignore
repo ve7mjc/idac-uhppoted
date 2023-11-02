@@ -45,3 +45,5 @@ wheels/
 *.json
 *.yaml
 *.yml
+logs/
+cache/

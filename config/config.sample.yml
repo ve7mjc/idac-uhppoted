@@ -15,7 +15,7 @@ uhppoted:
       device_id: 98765
 
 mqtt:
-  host: mqtt.somehost.com
+  hostname: mqtt.somehost.com
   username: mqttuser
   password: mqttpassword
   port: 1883

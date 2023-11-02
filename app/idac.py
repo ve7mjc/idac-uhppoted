@@ -1,5 +1,6 @@
-import requests
-
+import aiohttp
+from aiohttp import ClientResponseError, ClientConnectorError  # , ClientError
+from asyncio import TimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
@@ -7,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class TokenStatus(Enum):
+class LegacyTokenStatus(Enum):
     DISABLED = 1
     ENABLED = 2
     LOST = 3
@@ -15,24 +16,25 @@ class TokenStatus(Enum):
 
 
 @dataclass
-class Token:
+class LegacyToken:
     id: int
     code: str
-    status: TokenStatus
+    status: LegacyTokenStatus
     member_id: int
     member_label: str
 
 
 @dataclass
 class TokensList:
-    tokens: list[Token] = field(default_factory=list)
+    tokens: list[LegacyToken] = field(default_factory=list)
 
 
-def process_v1_token_list(content: str) -> list[Token]:
+def process_v1_token_list(content: str) -> list[LegacyToken]:
 
-    # data,token_id,member_id,token_status,token_label,null,null
+    # Legacy (v1) token list format:
+    # data,token_id,member_id,token_status,token_label,null,null\r\n
 
-    tokens: list[Token] = []
+    tokens: list[LegacyToken] = []
 
     expected_cols: int = 7
     for record in content.splitlines():
@@ -40,11 +42,12 @@ def process_v1_token_list(content: str) -> list[Token]:
         if len(parts) != expected_cols:
             logger.warning("warning! record has '%s' parts: %s",
                            len(parts), record)
-        token = Token(
+
+        token = LegacyToken(
             code=parts[0],
             id=int(parts[1]),
             member_id=parts[2],
-            status=TokenStatus(int(parts[3])),
+            status=LegacyTokenStatus(int(parts[3])),
             member_label=parts[4]
         )
         tokens.append(token)
@@ -63,23 +66,28 @@ class MembershipPortalClient:
         self.url_get_tokens_list = url_get_tokens_list
         self.url_put_token_events = url_put_token_events
 
-    def get_tokens_list(self) -> TokensList:
-
+    async def get_tokens_list(self) -> TokensList:
         try:
-            response = requests.get(self.url_get_tokens_list)
-            response.raise_for_status()
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.url_get_tokens_list) as response:
+                    response_data = await response.read()
+                    response_text = response_data.decode('utf-8')
+                    return process_v1_token_list(response_text)
 
-            with open("./cache/response.txt", "w") as file:
-                file.write(response.text)
-
-            tokens: list[Token] = process_v1_token_list(response.text)
-
-            logger.info(f"retrieved and processed {len(tokens)} tokens!")
-
-            return tokens
-
-        except requests.HTTPError as http_err:
-            print(f"HTTP error occurred: {http_err}")  # Python 3.6+
-        except Exception as err:
-            print(f"An error occurred: {err}")
-        return {}
+        except ClientResponseError as e:
+            # server returned an error response (e.g., 404, 500, etc.)
+            logger.error("HTTP Status Error: %s", e.status)
+            raise e
+        except ClientConnectorError as e:
+            # connection to server failed
+            logger.error("Connection Error: %s", e)
+            raise e
+        except TimeoutError:
+            # The request timed out
+            logger.error("The request timed out")
+            raise TimeoutError
+        except Exception as e:
+            # Catch any other exceptions that were not anticipated
+            logger.error("Unexpected error: %s", e)
+            raise e

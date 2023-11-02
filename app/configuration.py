@@ -17,7 +17,7 @@ logging.basicConfig()
 
 @dataclass
 class MqttConfiguration:
-    host: str
+    hostname: str
     username: str
     password: str
     port: Optional[int] = 1883
@@ -122,7 +122,7 @@ def get_config() -> Configuration:
     cfg = {}
 
     cfg['mqtt'] = {}
-    cfg['mqtt']['host'] = builder.get_key('mqtt.host')
+    cfg['mqtt']['hostname'] = builder.get_key('mqtt.hostname')
     cfg['mqtt']['username'] = builder.get_key('mqtt.user')
     cfg['mqtt']['password'] = builder.get_key('mqtt.password')
 
@@ -137,7 +137,7 @@ def get_config() -> Configuration:
         builder.get_key('membership_portal.url_put_token_events')
 
     cfg['mqtt'] = {}
-    cfg['mqtt']['host'] = builder.get_key('mqtt.host')
+    cfg['mqtt']['hostname'] = builder.get_key('mqtt.hostname')
     cfg['mqtt']['username'] = builder.get_key('mqtt.username')
     cfg['mqtt']['password'] = builder.get_key('mqtt.password')
 

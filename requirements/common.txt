@@ -1,4 +1,7 @@
-paho-mqtt
 pyyaml
 python-dotenv
-requests
+aiomqtt
+aiohttp
+
+# requests
+# paho-mqtt

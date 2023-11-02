@@ -1,114 +1,236 @@
 from configuration import get_config, Configuration
-from idac import MembershipPortalClient
-from schema import Request
+from idac import MembershipPortalClient, LegacyToken  # , LegacyTokenStatus
+# from rfid.redbee import redbee_hex_str_to_wiegand34
+from schema import UhppotedRequest
 
 # from typing import Optional
-from dataclasses import asdict
+import asyncio
+# from dataclasses import asdict
 import logging
 from logging.handlers import RotatingFileHandler
-from time import sleep
+from time import time
 import os
 import json
 
-import paho.mqtt.client as mqtt
+# import paho.mqtt.client as mqtt
+from aiomqtt import Client as AsyncMqttClient, MqttError
 
 # establish a logger here in the possibility this is used as as module
 logger = logging.getLogger()
 
-# MQTT Return Codes and their description
-MQTT_RC: dict[int, str] = {
-    0: "Connection successful",
-    1: "Connection refused - incorrect protocol version",
-    2: "Connection refused - invalid client identifier",
-    3: "Connection refused - server unavailable",
-    4: "Connection refused - bad username or password",
-    5: "Connection refused - not authorized"
-}
+
+class UhppoteController:
+
+    device_id: str
+    mqtt_topic_root: str
+    publish_queue: asyncio.Queue
+    last_request_id: int
+
+    def __init__(self, device_id: str, publish_queue: asyncio.Queue, mqtt_topic_root: str):
+        self.device_id = device_id
+        self.mqtt_topic_root = mqtt_topic_root
+        self.last_request_id = 0
+        self.publish_queue = publish_queue
+
+    def _build_request(self, topic: str) -> UhppotedRequest:
+        request_id = self.last_request_id + 1
+        request = UhppotedRequest(
+            request_id=request_id,
+            device_id=self.device_id,
+            topic=topic,
+            payload={
+                'message': {
+                    'request': {
+                        # 'request-id': request_id,
+                        'client-id': 'idac',
+                        # 'reply-to':
+                        'device-id': self.device_id
+                    }
+                }
+            }
+        )
+        self.last_request_id += 1
+        return request
+
+    async def get_status(self) -> None:
+        topic = f"{self.mqtt_topic_root}/requests/device/status:get"
+        await self.publish_queue.put(self._build_request(topic))
+
+    async def get_cards(self) -> None:
+        topic = f"{self.mqtt_topic_root}/requests/device/cards:get"
+        await self.publish_queue.put(self._build_request(topic))
+
+    async def get_card(self, card_number: int) -> None:
+        topic = f"{self.mqtt_topic_root}/requests/device/cards:get"
+        request = self._build_request(topic)
+        request.payload['message']['request']['card-number'] = card_number
+        await self.publish_queue.put(request)
 
 
-class UhppotedClient:
-    pass
+class IdacUhppotedAdapter:
 
-
-class IdacAdapter:
-
-    last_request: int
-    mqttc: mqtt.Client
+    _is_running: bool  # property 'self.is_running'
+    _mqtt_connected: bool  # property 'self.mqtt_connected'
 
     config: Configuration
 
+    controllers: dict[str, UhppoteController]
+
     portal: MembershipPortalClient
+
+    stopped: bool
+
+    mqtt_publish_queue: asyncio.Queue
 
     def __init__(self, config: Configuration) -> None:
 
         self.config = config
 
+        self._is_running = True
+        self._mqtt_connected = False
+
         if len(self.config.uhppoted.devices) == 0:
             raise Exception("no UHPPOTE devices configured!")
+
+        self.mqtt_publish_queue = asyncio.Queue()
+
+        # configure helper classes for the controllers
+        self.controllers = {}
+        for device in self.config.uhppoted.devices:
+            self.controllers[device.device_id] = UhppoteController(
+                device_id=device.device_id,
+                mqtt_topic_root=self.config.uhppoted.mqtt_topic_root,
+                publish_queue=self.mqtt_publish_queue)
 
         self.portal = MembershipPortalClient(
             url_get_tokens_list=self.config.membership_portal.url_get_tokens_list,
             url_put_token_events=self.config.membership_portal.url_put_token_events)
 
-        self.last_request = 0
+    def process_portal_legacy_tokens_list(self, tokens: list[LegacyToken]) -> None:
+        pass
+        # redbee_hex_str_to_wiegand34
 
-        self.mqttc = mqtt.Client()
+    async def portal_token_list_getter_task(self):
+        while True:
+            logger.debug("requesting tokens list from portal")
+            try:
+                tokens: list[LegacyToken] = await self.portal.get_tokens_list()
+                self.process_portal_legacy_tokens_list(tokens)
+            except Exception as e:
+                logger.info("unable to obtain tokens list: %s", e)
 
-        self.mqttc.username_pw_set(self.config.mqtt.username,
-                                   self.config.mqtt.password)
+            await asyncio.sleep(10)
 
-        self.mqttc.on_connect = self.on_mqtt_connect
-        self.mqttc.on_message = self.on_mqtt_message
+    async def _mqtt_task(self):
+        # mqtt_connect_timeout: float = 5
+        invalid_connect_attempts: int = 0
+        while self.is_running:
+            connect_attempt_time: float = time()
+            try:
+                async with AsyncMqttClient(
+                    hostname=self.config.mqtt.hostname,
+                    port=self.config.mqtt.port,
+                    username=self.config.mqtt.username,
+                    password=self.config.mqtt.password
+                ) as client:
 
-        self.mqttc.connect(self.config.mqtt.host, self.config.mqtt.port, 60)
+                    invalid_connect_attempts = 0  # reset our counter
+                    self._mqtt_connected = True
 
-        self.mqttc.loop_start()
+                    logger.debug('mqtt connected to broker')
 
-        tokens_list = self.portal.get_tokens_list()
+                    sub_topics: list[str] = [
+                        f"{self.config.uhppoted.mqtt_topic_root}/events/#",
+                        f"{self.config.uhppoted.mqtt_topic_root}/replies/#"
+                    ]
+                    for sub_topic in sub_topics:
+                        logger.debug("subscribed to topic: %s", sub_topic)
+                        await client.subscribe(sub_topic)
 
-        for token in tokens_list:
-            print(token)
+                    # MQTT forever loop of checking and publishing messages
+                    while self.is_running:
 
-        # run for 5 seconds then peace out
-        sleep(5)
-        self.mqttc.loop_stop()
+                        publisher = asyncio.create_task(self.mqtt_producer(client))
+                        receiver = asyncio.create_task(self.mqtt_consumer(client))
+                        await asyncio.gather(publisher, receiver)
 
-    def on_mqtt_connect(self, client, userdata, flags, rc):
+                        print("we are here")
 
-        if rc != 0:
-            logger.error("error connecting to mqtt %s@%s:%s - %s",
-                         self.config.mqtt.username, self.config.mqtt.host,
-                         self.config.mqtt.port, {MQTT_RC.get(rc, 'Unknown code')})
+                    # cancel connection
+                    raise asyncio.CancelledError()
 
-            return
+            except asyncio.CancelledError:
+                # leaving the async with block triggers disconnection
+                self._mqtt_connected = False
+                logger.debug('disconnecting from mqtt broker')
+                return
 
-        logger.info("connected to mqtt broker %s:%s",
-                    self.config.mqtt.host, self.config.mqtt.port)
+            except asyncio.TimeoutError:
+                self._mqtt_connected = False
+                invalid_connect_attempts += 1
+                logger.error("mqtt connect timed out!")
 
-        self.mqttc.subscribe(f"{self.config.uhppoted.mqtt_topic_root}/events/#")
-        self.mqttc.subscribe(f"{self.config.uhppoted.mqtt_topic_root}/replies/#")
+            except MqttError as e:
+                self._mqtt_connected = False
+                invalid_connect_attempts += 1
+                logger.error("mqtt error: %s", e)
 
-        self.send_request(self.generate_request())
+                delay_secs: float = 0
 
-    def on_mqtt_message(self, client, userdata, msg):
-        print(f"Received message '{msg.payload.decode()}' on topic '{msg.topic}'")
+                # scale delays up to 30 seconds for successive connection errors
+                if invalid_connect_attempts > 2:
+                    delay_secs = invalid_connect_attempts * 2
+                    if delay_secs > 30:
+                        delay_secs = 30
 
-    def send_request(self, request: Request) -> None:
-        req_topic = f"{self.config.uhppoted.mqtt_topic_root}/requests/device/status:get"
-        # req = Request(device_id="425035705", client_id="halocal")
-        self.mqttc.publish(req_topic, json.dumps(asdict(request)).encode())
-        logger.debug(f"sent request: topic = '{req_topic}'\n request = {request}")
-        self.last_request += 1
-        # request sent
+                # amnesty for time served
+                if (time() - connect_attempt_time) > delay_secs:
+                    delay_secs = 0
 
-    def generate_request(self) -> Request:
-        request_id = f'idac-r{self.last_request + 1}'
-        # TODO: only looking at first device right now
-        return Request(
-            request_id=request_id,
-            client_id=self.config.uhppoted.client_id,
-            device_id=self.config.uhppoted.devices[0].device_id,
-        )
+                if delay_secs:
+                    print(f"throttling connection attempts; sleeping for {delay_secs}")
+
+                await asyncio.sleep(delay_secs)
+
+    async def mqtt_consumer(self, client: AsyncMqttClient) -> None:
+        async with client.messages() as messages:
+            async for message in messages:
+                print(f"Received message on topic {message.topic}: {message.payload.decode()}")
+
+    async def mqtt_producer(self, client: AsyncMqttClient) -> None:
+        while True:
+            request: UhppotedRequest = await self.mqtt_publish_queue.get()
+            topic: str = request.topic
+            payload: bytes = json.dumps(request.payload).encode()
+            logger.debug("publishing '%s' -> '%s'", request.topic, payload)
+            await client.publish(topic, payload)
+            self.mqtt_publish_queue.task_done()
+
+    async def start(self) -> None:
+        self.tasks = [
+            asyncio.create_task(self._mqtt_task()),
+            # asyncio.create_task(self._periodic_status_request()),
+            asyncio.create_task(self.portal_token_list_getter_task())
+        ]
+
+        for controller in self.controllers.values():
+            await controller.get_cards()
+
+        await asyncio.gather(*self.tasks)
+
+    async def stop(self):
+        self._is_running = False
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(self.tasks, return_exceptions=True)
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    @property
+    def mqtt_connected(self) -> bool:
+        return self._mqtt_connected
 
 
 if __name__ == '__main__':
@@ -144,7 +266,7 @@ if __name__ == '__main__':
         config = get_config()
     except FileNotFoundError:
         print("cannot locate config file!")
-        sleep(120)
         exit(1)
 
-    idac = IdacAdapter(config)
+    idac = IdacUhppotedAdapter(config)
+    asyncio.run(idac.start())
