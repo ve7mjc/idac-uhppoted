@@ -1,5 +1,6 @@
 from typing import Optional
 from dataclasses import dataclass
+import asyncio
 
 
 @dataclass
@@ -15,6 +16,7 @@ class UhppotedRequest:
     topic: str
     payload: dict
     request_id: Optional[int] = None
+    future: Optional[asyncio.Future] = None
 
 
 @dataclass

@@ -45,6 +45,8 @@ class IdacUhppotedAdapter:
     debug_methods: bool
     debug_ignore_methods: list[str]
 
+    request_futures: dict[int, asyncio.Future]
+
     def __init__(self, config: Configuration) -> None:
 
         self.config = config
@@ -76,6 +78,9 @@ class IdacUhppotedAdapter:
         self.portal = MembershipPortalClient(
             url_get_tokens_list=self.config.membership_portal.url_get_tokens_list,
             url_put_token_events=self.config.membership_portal.url_put_token_events)
+
+        # manage futures so we can associate the replies to the waiting requesters
+        self.request_futures = {}
 
         # debugging
         self.debug_methods: bool = True
@@ -233,6 +238,7 @@ class IdacUhppotedAdapter:
                 await asyncio.sleep(delay_secs)
 
     async def _mqtt_consumer_task(self, client: AsyncMqttClient) -> None:
+
         reply_topic = f"{self.config.uhppoted.mqtt_topic_root}/replies/{self.client_id}"
         async with client.messages() as messages:
             async for message in messages:
@@ -263,7 +269,10 @@ class IdacUhppotedAdapter:
                                               response=response,
                                               request_id=request_id)
 
-                        await self.devices[device_id].process_reply(reply)
+                        if request_id in self.request_futures:
+                            future = self.request_futures[request_id]
+                            if not future.done():
+                                future.set_result(reply)
 
                     except Exception as e:
                         logger.error(f"{e}")
@@ -273,10 +282,19 @@ class IdacUhppotedAdapter:
                                  message.topic, message.payload.decode())
 
     async def _mqtt_producer_task(self, client: AsyncMqttClient) -> None:
+        last_request_id: int = 0
         while True:
             request: UhppotedRequest = await self.mqtt_publish_queue.get()
+
+            # manage the request id and asyncio.Future
+            request.request_id = str(last_request_id + 1)
+            last_request_id += 1
+            if request.future is not None:
+                self.request_futures[request.request_id] = request.future
+
             topic: str = request.topic
             request.payload['message']['request']['client-id'] = self.client_id
+            request.payload['message']['request']['request-id'] = request.request_id
             payload: bytes = json.dumps(request.payload).encode()
             if self.debug_methods and request.method not in self.debug_ignore_methods:
                 logger.debug("publishing '%s' -> '%s'", request.topic, payload)
@@ -411,10 +429,10 @@ class IdacUhppotedAdapter:
             for controller in self.devices.values():
                 await controller.delete_cards()
 
-        for controller in self.devices.values():
-            await controller.get_cards()
+        # for controller in self.devices.values():
+        #     await controller.get_cards()
 
-        await self.sync_controllers()
+        # await self.sync_controllers()
 
         #
         # We can start system health check now

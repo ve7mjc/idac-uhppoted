@@ -20,7 +20,7 @@ class UhppoteController:
     request_reply_timeout: float
     state: ControllerState
     publish_queue: asyncio.Queue
-    reply_queue: asyncio.Queue
+    reply_queues: dict[str, asyncio.Queue]
 
     def __init__(self, device_id: str, publish_queue: asyncio.Queue, mqtt_topic_root: str):
         self.device_id = device_id
@@ -30,12 +30,14 @@ class UhppoteController:
 
         self.last_request_id = 0
         self.publish_queue = publish_queue
-        self.reply_queue = asyncio.Queue()
+        self.reply_queues = {}
+        self.reply_queues = asyncio.Queue()
         self.request_reply_timeout = DEFAULT_CONTROLLER_REQUEST_REPLY_TIMEOUT
 
     def _build_request(self, method: str, topic: str) -> UhppotedRequest:
         request_id = self.last_request_id + 1
         request = UhppotedRequest(
+            future=asyncio.Future(),
             method=method,
             request_id=request_id,
             device_id=self.device_id,
@@ -52,7 +54,18 @@ class UhppoteController:
         self.last_request_id += 1
         return request
 
-    #
+    async def _await_response(self, request: UhppotedRequest) -> UhppotedReply:
+        await self.publish_queue.put(request)
+        timeout: int = self.request_reply_timeout
+        try:
+            return await asyncio.wait_for(request.future, timeout)
+        except asyncio.TimeoutError as e:
+            logger.error(f"request {request.method} timed out!")
+            raise e
+        except asyncio.CancelledError as e:
+            logger.error("future was cancelled!", e)
+            raise e
+
     def set_valid_response(self, method_type: Optional[str] = None) -> None:
         self.state.last_valid_time = time()
 
@@ -61,17 +74,16 @@ class UhppoteController:
         topic = f"{self.mqtt_topic_root}/requests/device/card:delete"
         request = self._build_request('delete-card', topic)
         request.payload['message']['request']['card-number'] = card_number
-        await self.publish_queue.put(request)
 
+        reply = await self._await_response(request)
+
+        print("delete card response: ", reply.response)
         # wait for response!!
 
     async def delete_cards(self) -> None:
         # Deletes all cards from a controller
         topic = f"{self.mqtt_topic_root}/requests/device/cards:delete"
-        await self.publish_queue.put(self._build_request('delete-cards', topic))
-
-        reply: UhppotedReply = await asyncio.wait_for(
-            self.reply_queue.get(), self.request_reply_timeout)
+        reply = await self._await_response('delete-cards', topic)
 
         if reply.response.get('deleted', False) is not True:
             raise Exception("unexpected response from delete_cards!")
@@ -84,30 +96,24 @@ class UhppoteController:
 
     async def get_status(self) -> None:
         topic = f"{self.mqtt_topic_root}/requests/device/status:get"
-        await self.publish_queue.put(self._build_request('get-status', topic))
-
-        reply: UhppotedReply = await self.reply_queue.get()
-
-        if reply.method != 'get-status':
-            raise Exception("incorrect reply!")
+        request = self._build_request('get-status', topic)
+        reply = await self._await_response(request)
 
         try:
             status = reply.response['status']
             self.set_valid_response()
-            self._process_status_reply(status)
-
         except Exception:
             raise Exception("invalid response: %s", reply.response)
+
+        self._process_status_reply(status)
 
     def _process_status_reply(self, status: dict) -> None:
         pass
 
     async def get_cards(self) -> list[int]:
         topic = f"{self.mqtt_topic_root}/requests/device/cards:get"
-        await self.publish_queue.put(self._build_request('get-cards', topic))
-
-        reply: UhppotedReply = await asyncio.wait_for(
-            self.reply_queue.get(), self.request_reply_timeout)
+        request = self._build_request('get-cards', topic)
+        reply = self._await_response(request)
 
         try:
             # ensure that we treat a valid response of no cards as known state
@@ -133,10 +139,8 @@ class UhppoteController:
         topic = f"{self.mqtt_topic_root}/requests/device/card:get"
         request = self._build_request('get-card', topic)
         request.payload['message']['request']['card-number'] = card_number
-        await self.publish_queue.put(request)
 
-        reply: UhppotedReply = await asyncio.wait_for(
-            self.reply_queue.get(), self.request_reply_timeout)
+        reply = await self._await_response(request)
 
         logger.debug("get_card() response: %s", reply.response)
 
@@ -153,10 +157,7 @@ class UhppoteController:
             "start-date": "2021-01-01",
             "end-date": "2029-12-31"
         }
-        await self.publish_queue.put(request)
-
-        reply: UhppotedReply = await asyncio.wait_for(
-            self.reply_queue.get(), self.request_reply_timeout)
+        reply = await self._await_response(request)
 
         if 'card' not in reply.response or (
                 reply.response['card'].get('card-number') != card_number):
