@@ -48,6 +48,7 @@ class Configuration:
     mqtt: MqttConfiguration
     uhppoted: UhppoteServerConfiguration
     devices: list[UhppoteDeviceConfiguration] = field(default_factory=list)
+    maintainer_cards: dict[str, int] = field(default_factory=dict)
 
 
 class ConfigBuilder:
@@ -144,6 +145,8 @@ def get_config() -> Configuration:
     cfg['uhppoted'] = {}
     cfg['uhppoted']['client_id'] = builder.get_key('uhppoted.client_id', 'idac')
     cfg['uhppoted']['devices'] = []
+
+    cfg['maintainer_cards'] = builder.get_key('maintainer_cards')
 
     # break out the configuration of devices!
     devices: Union[list, None] = builder.get_key('uhppoted.devices')

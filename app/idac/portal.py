@@ -1,5 +1,5 @@
 import aiohttp
-from aiohttp import ClientResponseError, ClientConnectorError  # , ClientError
+from aiohttp import ClientResponseError, ClientConnectorError
 from asyncio import TimeoutError
 from dataclasses import dataclass, field
 from enum import Enum

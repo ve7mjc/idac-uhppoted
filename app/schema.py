@@ -1,24 +1,18 @@
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
-class UhppotedRequest:
-    device_id: str
-    topic: str
-    payload: dict
-    request_id: Optional[int] = None
+class CardListChanges:
+    num_added: int = 0
+    num_removed: int = 0
+    num_disabled: int = 0
+    num_enabled: int = 0
 
-
-@dataclass
-class UhppotedReply:
-    method: str
-    device_id: str
-    response: dict
-    request_id: Optional[int] = None
-
-
-@dataclass
-class Card:
-    code: int
-    valid: bool = False
+    @property
+    def num_changes(self) -> int:
+        changes: int = 0
+        changes += self.num_added
+        changes += self.num_removed
+        changes += self.num_disabled
+        changes += self.num_enabled
+        return changes

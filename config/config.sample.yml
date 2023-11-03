@@ -37,3 +37,7 @@ uhppoted:
 mqtt:
   host: mqtt.somehost.com
   username: mqttuser
+
+maintainer_codes:
+  - 123456
+  - 654321
