@@ -10,6 +10,7 @@ class UhppotedCard:
 
 @dataclass
 class UhppotedRequest:
+    method: str
     device_id: str
     topic: str
     payload: dict

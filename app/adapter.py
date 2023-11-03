@@ -42,6 +42,9 @@ class IdacUhppotedAdapter:
     cards_last_changed: Optional[datetime] = None
     cards_last_fetched: Optional[datetime] = None
 
+    debug_methods: bool
+    debug_ignore_methods: list[str]
+
     def __init__(self, config: Configuration) -> None:
 
         self.config = config
@@ -73,6 +76,10 @@ class IdacUhppotedAdapter:
         self.portal = MembershipPortalClient(
             url_get_tokens_list=self.config.membership_portal.url_get_tokens_list,
             url_put_token_events=self.config.membership_portal.url_put_token_events)
+
+        # debugging
+        self.debug_methods: bool = True
+        self.debug_ignore_methods = ['get-cards', 'get-status']
 
     def process_portal_legacy_tokens_list(self, legacy_tokens: list[LegacyToken]) -> None:
 
@@ -226,8 +233,6 @@ class IdacUhppotedAdapter:
                 await asyncio.sleep(delay_secs)
 
     async def _mqtt_consumer_task(self, client: AsyncMqttClient) -> None:
-        debug_method_responses: bool = True
-        debug_ignore_methods = ['get-cards', 'get-status']
         reply_topic = f"{self.config.uhppoted.mqtt_topic_root}/replies/{self.client_id}"
         async with client.messages() as messages:
             async for message in messages:
@@ -244,7 +249,7 @@ class IdacUhppotedAdapter:
                         response: dict = m['message']['reply']['response']
                         request_id: str = m['message']['reply'].get('request-id')
 
-                        if debug_method_responses and method not in debug_ignore_methods:
+                        if self.debug_methods and method not in self.debug_ignore_methods:
                             print(f"method '{method}' response:\n",
                                   json.dumps(m, indent=4))
 
@@ -273,7 +278,11 @@ class IdacUhppotedAdapter:
             topic: str = request.topic
             request.payload['message']['request']['client-id'] = self.client_id
             payload: bytes = json.dumps(request.payload).encode()
-            logger.debug("publishing '%s' -> '%s'", request.topic, payload)
+            if self.debug_methods and request.method not in self.debug_ignore_methods:
+                logger.debug("publishing '%s' -> '%s'", request.topic, payload)
+                print(f"method '{request.method}' response:\n",
+                      json.dumps(request.payload, indent=4))
+
             await client.publish(topic, payload)
             self.mqtt_publish_queue.task_done()
 
@@ -314,8 +323,16 @@ class IdacUhppotedAdapter:
             await asyncio.sleep(15)
 
     async def sync_controllers(self) -> None:
+
         if not self.controller_sync_enabled:
+            logger.warn("sync_controllers is disabled; ignoring")
             return
+
+        # mirror list - merge maintainer cards
+        cards_list: dict[int, UhppotedCard] = self.cards
+        for m_label, m_card in self.config.maintainer_cards.items():
+            if m_card not in cards_list or cards_list[m_card].valid is False:
+                cards_list[m_card] = UhppotedCard(code=m_card, valid=True)
 
         # confirm prerequisite conditions
         if len(self.cards) == 0:
@@ -335,6 +352,8 @@ class IdacUhppotedAdapter:
     # - Organization UhppotedCard List State
     #
     async def start(self) -> None:
+
+        self._controller_sync_enabled = True
 
         service_start_time: float = time()
 
@@ -394,6 +413,8 @@ class IdacUhppotedAdapter:
 
         for controller in self.devices.values():
             await controller.get_cards()
+
+        await self.sync_controllers()
 
         #
         # We can start system health check now

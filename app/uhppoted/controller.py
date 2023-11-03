@@ -33,9 +33,10 @@ class UhppoteController:
         self.reply_queue = asyncio.Queue()
         self.request_reply_timeout = DEFAULT_CONTROLLER_REQUEST_REPLY_TIMEOUT
 
-    def _build_request(self, topic: str) -> UhppotedRequest:
+    def _build_request(self, method: str, topic: str) -> UhppotedRequest:
         request_id = self.last_request_id + 1
         request = UhppotedRequest(
+            method=method,
             request_id=request_id,
             device_id=self.device_id,
             topic=topic,
@@ -58,7 +59,7 @@ class UhppoteController:
     async def delete_card(self, card_number: int) -> None:
         # Deletes a card from a controller
         topic = f"{self.mqtt_topic_root}/requests/device/card:delete"
-        request = self._build_request(topic)
+        request = self._build_request('delete-card', topic)
         request.payload['message']['request']['card-number'] = card_number
         await self.publish_queue.put(request)
 
@@ -67,7 +68,7 @@ class UhppoteController:
     async def delete_cards(self) -> None:
         # Deletes all cards from a controller
         topic = f"{self.mqtt_topic_root}/requests/device/cards:delete"
-        await self.publish_queue.put(self._build_request(topic))
+        await self.publish_queue.put(self._build_request('delete-cards', topic))
 
         reply: UhppotedReply = await asyncio.wait_for(
             self.reply_queue.get(), self.request_reply_timeout)
@@ -83,7 +84,7 @@ class UhppoteController:
 
     async def get_status(self) -> None:
         topic = f"{self.mqtt_topic_root}/requests/device/status:get"
-        await self.publish_queue.put(self._build_request(topic))
+        await self.publish_queue.put(self._build_request('get-status', topic))
 
         reply: UhppotedReply = await self.reply_queue.get()
 
@@ -103,7 +104,7 @@ class UhppoteController:
 
     async def get_cards(self) -> list[int]:
         topic = f"{self.mqtt_topic_root}/requests/device/cards:get"
-        await self.publish_queue.put(self._build_request(topic))
+        await self.publish_queue.put(self._build_request('get-cards', topic))
 
         reply: UhppotedReply = await asyncio.wait_for(
             self.reply_queue.get(), self.request_reply_timeout)
@@ -120,7 +121,7 @@ class UhppoteController:
 
         self.state.cards = {}  # proceed as we have a valid cards list response
         for card in reply.response['cards']:
-            self.state.cards[card] = {'code': card}
+            self.state.cards[card] = {'card-number': card}
 
         cards_str: str = ', '.join(str(i) for i in self.state.cards)
         logger.debug(f"controller cards ({len(self.state.cards)}): {cards_str}")
@@ -130,7 +131,7 @@ class UhppoteController:
     async def get_card(self, card_number: int) -> dict:
         # Retrieves a card record from a controller
         topic = f"{self.mqtt_topic_root}/requests/device/card:get"
-        request = self._build_request(topic)
+        request = self._build_request('get-card', topic)
         request.payload['message']['request']['card-number'] = card_number
         await self.publish_queue.put(request)
 
@@ -145,7 +146,7 @@ class UhppoteController:
     async def put_card(self, card_number: int, doors: list[int] = []) -> None:
         # adds or updates a card record on a controller
         topic = f"{self.mqtt_topic_root}/requests/device/card:put"
-        request = self._build_request(topic)
+        request = self._build_request('put-card', topic)
         request.payload['message']['request']['card'] = {
             'card-number': card_number,
             'doors': {'1': True, '2': True, '3': True, '4': True},
@@ -161,6 +162,8 @@ class UhppoteController:
                 reply.response['card'].get('card-number') != card_number):
             raise Exception("put_card(%s) error! response %s",
                             card_number, reply.response)
+
+        self.state.cards[card_number] = {'card-number': card_number}
 
         self.set_valid_response()
 
@@ -180,15 +183,25 @@ class UhppoteController:
         await self.reply_queue.put(reply)
 
     async def sync_cards(self, cards: dict[int, UhppotedCard]) -> None:
-        if self.cards is None:  # cannot sync unless we know our cards
+
+        if self.state.cards is None:  # cannot sync unless we know our cards
             return
 
         for code, card in cards.items():
-            if code not in self.cards:
+            if code not in self.state.cards:
                 if not card.valid:
                     continue  # card is not valid
                 logger.debug("adding card %s", code)
                 await self.put_card(code)
+
+        # remove cards that must be removed
+        cards_for_removal: list[int] = []
+        for code, card in self.state.cards.items():
+            if code not in cards:
+                cards_for_removal.append(code)
+        for card_number in cards_for_removal:
+            logger.info(f"removing card '{card_number}' from controller")
+            await self.delete_card(card_number)
 
     # @property
     # def comms_timedout(self) -> bool:
