@@ -1,4 +1,7 @@
-from .schema import ControllerState, UhppotedRequest, UhppotedReply, UhppotedCard
+from .schema import (
+    ControllerState, UhppotedRequest, UhppotedReply,
+    UhppotedCard, ControllerException, ControllerTimeout
+)
 from literals import (
     DEFAULT_CONTROLLER_REQUEST_REPLY_TIMEOUT,
     DEFAULT_CONTROLLER_COMM_TIMEOUT_SECS
@@ -58,13 +61,17 @@ class UhppoteController:
         await self.publish_queue.put(request)
         timeout: int = self.request_reply_timeout
         try:
-            return await asyncio.wait_for(request.future, timeout)
-        except asyncio.TimeoutError as e:
+            reply = await asyncio.wait_for(request.future, timeout)
+            del request.future
+            return reply
+        except asyncio.TimeoutError:
             logger.error(f"request {request.method} timed out!")
-            raise e
+            raise ControllerTimeout()
         except asyncio.CancelledError as e:
             logger.error("future was cancelled!", e)
-            raise e
+            raise ControllerException(e)
+        except Exception as e:
+            raise ControllerException(e)
 
     def set_valid_response(self, method_type: Optional[str] = None) -> None:
         self.state.last_valid_time = time()
@@ -113,7 +120,7 @@ class UhppoteController:
     async def get_cards(self) -> list[int]:
         topic = f"{self.mqtt_topic_root}/requests/device/cards:get"
         request = self._build_request('get-cards', topic)
-        reply = self._await_response(request)
+        reply = await self._await_response(request)
 
         try:
             # ensure that we treat a valid response of no cards as known state

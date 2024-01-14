@@ -5,6 +5,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import signal
 
 #
 # Configure logging
@@ -34,11 +35,23 @@ logger.setLevel(logging.DEBUG)
 console_handler.setLevel(logging.WARNING)
 file_handler.setLevel(logging.DEBUG)
 
+# squelch noisy module loggers
+logging.getLogger('asyncio').setLevel(logging.WARNING)
+
 try:
     config = get_config()
 except FileNotFoundError:
     logger.error("cannot locate config file!")
     exit(1)
 
+loop = asyncio.get_event_loop()
+
 adapter = IdacUhppotedAdapter(config)
-asyncio.run(adapter.start())
+
+for sig in (signal.SIGINT, signal.SIGTERM):
+    loop.add_signal_handler(sig, lambda: asyncio.create_task(adapter.shutdown()))
+
+try:
+    loop.run_until_complete(adapter.start())
+except asyncio.exceptions.CancelledError:
+    logger.info("successful shutdown")

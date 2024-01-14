@@ -1,7 +1,10 @@
 # project libs
 from configuration import Configuration
 from uhppoted.controller import UhppoteController
-from uhppoted.schema import UhppotedCard, UhppotedReply, UhppotedRequest
+from uhppoted.schema import (
+    UhppotedCard, UhppotedReply, UhppotedRequest,
+    ControllerException  # , ControllerTimeout
+)
 from idac.portal import MembershipPortalClient, LegacyToken, LegacyTokenStatus
 from rfid.redbee import redbee_hex_str_to_wiegand34
 from schema import CardListChanges
@@ -24,9 +27,9 @@ from aiomqtt import Client as AsyncMqttClient, MqttError
 logger = logging.getLogger(__name__)
 
 
-class IdacUhppotedAdapter:
+class IdacUhppotedAdapter():
 
-    _is_running: bool  # property 'self.is_running'
+    stop_event: asyncio.Event
     _mqtt_connected: bool  # property 'self.mqtt_connected'
     config: Configuration
     client_id: str
@@ -36,6 +39,9 @@ class IdacUhppotedAdapter:
     stopped: bool
     mqtt_publish_queue: asyncio.Queue
     _controller_sync_enabled: bool
+    tasks: list[asyncio.Task]
+    last_uhppoted_watchdog_alive: time
+    last_uhppoted_health_check_alive: time
 
     # list of organizational cards (intention)
     cards: dict[str, UhppotedCard]
@@ -53,10 +59,16 @@ class IdacUhppotedAdapter:
 
         self.client_id = 'idac'
 
-        self._is_running = True
+        self.stop_event = asyncio.Event()
         self._controller_sync_enabled = False
         self._mqtt_connected = False
         self.last_heard_time = 0
+        self.tasks = []
+
+        # assume we have heard these for now -- we are more concerned
+        # about their absence
+        self.last_uhppoted_watchdog_alive = time()
+        self.last_uhppoted_health_check_alive = time()
 
         if len(self.config.uhppoted.devices) == 0:
             raise Exception("no UHPPOTE devices configured!")
@@ -79,7 +91,7 @@ class IdacUhppotedAdapter:
             url_get_tokens_list=self.config.membership_portal.url_get_tokens_list,
             url_put_token_events=self.config.membership_portal.url_put_token_events)
 
-        # manage futures so we can associate the replies to the waiting requesters
+        # associate replies to their awaiting requesters via futures
         self.request_futures = {}
 
         # debugging
@@ -92,7 +104,7 @@ class IdacUhppotedAdapter:
 
         # assume a list of no cards is a no-go
         if len(legacy_tokens) == 0:
-            raise Exception("portal cards list is empty!")
+            raise Exception("received portal cards list is empty!")
 
         self.cards_last_fetched = time()
 
@@ -108,9 +120,10 @@ class IdacUhppotedAdapter:
                     valid=legacy_token.status == LegacyTokenStatus.ENABLED or False
                 )
             except Exception as e:
+                # note: a malformed portal token is going to get noisy over time
                 logger.error("unable to process token: %s [%s]", legacy_token, e)
 
-        # is there a card we do not have
+        # search for new cards aka cards we do not have locally
         for portal_card in portal_cards.values():
             if portal_card.code not in self.cards:
                 changes.num_added += 1
@@ -125,18 +138,17 @@ class IdacUhppotedAdapter:
             # force anyways
             self.cards[portal_card.code] = portal_card
 
-        # search for removals
+        # search for cards no longer in the remote list
         cards_for_removal: list[int] = []
         for card_code in self.cards:
             if card_code not in portal_cards:
                 cards_for_removal.append(card_code)
                 changes.num_removed += 1
-
         for card in cards_for_removal:
             logger.debug(f'removing card {card}')
             del self.cards[card]
 
-        # describe nature of changes
+        # describe nature and magnitude of changes
         if changes.num_changes > 0 and not local_empty:
             c: list[str] = []
             if changes.num_added:
@@ -159,27 +171,43 @@ class IdacUhppotedAdapter:
             self.cards_last_changed = time()
 
     async def _portal_token_list_getter_task(self):
+        loop_time: float = self.config.membership_portal.list_poll_time_secs
+        retry_time: float = 30
         while True:
             try:
                 tokens: list[LegacyToken] = await self.portal.get_tokens_list()
-                self.process_portal_legacy_tokens_list(tokens)
-                await self.sync_controllers()
             except Exception as e:
-                logger.info("unable to obtain tokens list: %s", e)
+                logger.error("could not obtain cards list from portal: %s", e)
+                await asyncio.sleep(retry_time)
+                continue
 
-            await asyncio.sleep(10)
+            try:
+                self.process_portal_legacy_tokens_list(tokens)
+            except Exception as e:
+                logger.error("could not process portal tokens list: %s", e)
+                await asyncio.sleep(retry_time)
+                continue
+
+            try:
+                await self.sync_controllers()
+                await asyncio.sleep(loop_time)
+            except Exception as e:
+                logger.error("could not syncronize controllers: %s", e)
+                await asyncio.sleep(retry_time)
 
     async def _mqtt_task(self):
         # mqtt_connect_timeout: float = 5
         invalid_connect_attempts: int = 0
-        while self.is_running:
+        while not self.stop_event.is_set():
             connect_attempt_time: float = time()
             try:
                 async with AsyncMqttClient(
                     hostname=self.config.mqtt.hostname,
                     port=self.config.mqtt.port,
                     username=self.config.mqtt.username,
-                    password=self.config.mqtt.password
+                    password=self.config.mqtt.password,
+                    timeout=60,
+                    keepalive=15
                 ) as client:
 
                     invalid_connect_attempts = 0  # reset our counter
@@ -189,16 +217,20 @@ class IdacUhppotedAdapter:
 
                     sub_topics: list[str] = [
                         f"{self.config.uhppoted.mqtt_topic_root}/events/#",
-                        f"{self.config.uhppoted.mqtt_topic_root}/replies/#"
+                        f"{self.config.uhppoted.mqtt_topic_root}/replies/#",
+                        f"{self.config.uhppoted.mqtt_topic_root}/system/#"
                     ]
                     for sub_topic in sub_topics:
                         logger.debug("subscribed to topic: %s", sub_topic)
                         await client.subscribe(sub_topic)
 
                     # MQTT forever loop of checking and publishing messages
-                    while self.is_running:
-                        publisher = asyncio.create_task(self._mqtt_producer_task(client))
-                        receiver = asyncio.create_task(self._mqtt_consumer_task(client))
+                    while not self.stop_event.is_set():
+                        publisher = asyncio.create_task(self._mqtt_producer_task(client),
+                                                        name="mqtt_producer")
+                        receiver = asyncio.create_task(self._mqtt_consumer_task(client),
+                                                       name="mqtt_consumer")
+                        self.tasks.extend([publisher, receiver])
                         await asyncio.gather(publisher, receiver)
 
                     # cancel connection since the tasks are done
@@ -233,12 +265,11 @@ class IdacUhppotedAdapter:
                     delay_secs = 0
 
                 if delay_secs:
-                    print(f"throttling connection attempts; sleeping for {delay_secs}")
+                    logger.debug(f"throttling connection attempts; sleeping for {delay_secs}")
 
                 await asyncio.sleep(delay_secs)
 
     async def _mqtt_consumer_task(self, client: AsyncMqttClient) -> None:
-
         reply_topic = f"{self.config.uhppoted.mqtt_topic_root}/replies/{self.client_id}"
         async with client.messages() as messages:
             async for message in messages:
@@ -275,7 +306,32 @@ class IdacUhppotedAdapter:
                                 future.set_result(reply)
 
                     except Exception as e:
-                        logger.error(f"{e}")
+                        logger.error("exception processing received message: "
+                                     "'%s', error=%s", message.payload.decode(), e)
+
+                elif message.topic.matches(f"{self.config.uhppoted.mqtt_topic_root}/system"):
+                    try:
+                        msg: dict = json.loads(message.payload.decode())['message']['system']
+                        if "alive" in msg:
+                            subsystem: str = msg['alive']['subsystem']
+                            if subsystem == "watchdog":
+                                self.last_uhppoted_watchdog_alive = time()
+                                logger.debug("uhppoted system watchdog: alive!")
+                            elif subsystem == "health-check":
+                                self.last_uhppoted_health_check_alive = time()
+                                logger.debug("uhppoted system health-check: alive!")
+
+                        elif "alert" in msg:
+                            subsystem: str = msg['alert']['subsystem']
+                            alert_msg: str = msg['alert']['message']
+
+                            logger.warning("uhppoted system.%s alert: %s",
+                                           subsystem, alert_msg)
+
+                        else:
+                            logger.warning("received unknown /system message: %s", msg)
+                    except Exception as e:
+                        logger.error("unable to process /system message: %s (%s)", msg, e)
 
                 else:
                     logger.debug("received an unmatched message: '%s' -> '%s'",
@@ -283,7 +339,7 @@ class IdacUhppotedAdapter:
 
     async def _mqtt_producer_task(self, client: AsyncMqttClient) -> None:
         last_request_id: int = 0
-        while True:
+        while not self.stop_event.is_set():
             request: UhppotedRequest = await self.mqtt_publish_queue.get()
 
             # manage the request id and asyncio.Future
@@ -308,7 +364,7 @@ class IdacUhppotedAdapter:
     async def _system_health_checker_task(self) -> None:
         remote_cards_list_unhealthy: bool = False
         controllers_unhealthy: list[int] = []
-        while True:
+        while not self.stop_event.is_set():
 
             # check controllers
             for device in self.devices.values():
@@ -321,7 +377,7 @@ class IdacUhppotedAdapter:
                     controllers_unhealthy.remove(device.device_id)
                     logger.info(f"controller {device.device_id} is healthy!")
 
-            if not self.valid_portal_cards_list:
+            if not self.is_portal_cards_valid:
                 if not remote_cards_list_unhealthy:
                     logger.error("remote cards list is UNHEALTHY")
                     remote_cards_list_unhealthy = True
@@ -334,7 +390,7 @@ class IdacUhppotedAdapter:
     async def _controller_status_poller_task(self) -> None:
         # be careful about firing off a request to a controller while
         # another task has already asked for it -- no locking yet
-        while True:
+        while not self.stop_event.is_set():
             for device in self.devices.values():
                 await device.get_status()
 
@@ -377,34 +433,37 @@ class IdacUhppotedAdapter:
 
         # begin the process of syncronization of controller and portal card list
         self.tasks = [
-            asyncio.create_task(self._mqtt_task()),
-            asyncio.create_task(self._portal_token_list_getter_task())
+            asyncio.create_task(self._mqtt_task(), name="mqtt_client"),
+            asyncio.create_task(self._portal_token_list_getter_task(),
+                                name="token_list_getter")
         ]
 
         #
         # Wait on MQTT connection
         #
         warned_mqtt_connecting: bool = False
-        while not self.mqtt_connected:
+        while not self.mqtt_connected and not self.stop_event.is_set():
             if (time() - service_start_time) > 3 and not warned_mqtt_connecting:
                 logger.warning("waiting for mqtt connection ...")
                 warned_mqtt_connecting = True
             await asyncio.sleep(0.05)
 
         for controller in self.devices.values():
-            await controller.get_status()
+            try:
+                await controller.get_status()
+            except ControllerException:
+                pass
 
         #
         # Wait on controllers to be considered healthy
+        # - warn every 5 seconds
         #
-        warned_controllers_healthy: bool = False
-        waiting_on_controllers_start_time: float = time()
+        warned_controllers_healthy: float = time()
         waiting_on_controller: bool = True
-        while waiting_on_controller:
-            if (time() - waiting_on_controllers_start_time) > 3 and (
-                    not warned_controllers_healthy):
+        while waiting_on_controller and not self.stop_event.is_set():
+            if (time() - warned_controllers_healthy) >= 5:
                 logger.warning("waiting for controllers ...")
-                warned_controllers_healthy = True
+                warned_controllers_healthy = time()
             waiting_on_controller = False
             for device in self.devices.values():
                 if not device.healthy:
@@ -413,46 +472,55 @@ class IdacUhppotedAdapter:
 
         #
         # Wait on remote portal cards list
+        # warn every 5 seconds
         #
-        warned_portal_list_waiting: bool = False
-        portal_list_wait_start_time: float = time()
-        while not self.valid_portal_cards_list:
-            if (time() - portal_list_wait_start_time) > 3 and (
-                    not warned_portal_list_waiting):
+        warned_portal_list_waiting: float = time()
+        while not self.is_portal_cards_valid and not self.stop_event.is_set():
+            if (time() - warned_portal_list_waiting) >= 5:
                 logger.warning("waiting for remote cards list ...")
-                warned_portal_list_waiting = True
+                warned_portal_list_waiting = time()
             waiting_on_controller = False
             await asyncio.sleep(0.05)
+
+        logger.info("system ready!")
 
         force_controller_refresh: bool = False
         if force_controller_refresh:
             for controller in self.devices.values():
-                await controller.delete_cards()
+                try:
+                    await controller.delete_cards()
+                except ControllerException as e:
+                    logger.error("could not delete all cards! error =", e)
 
-        # for controller in self.devices.values():
-        #     await controller.get_cards()
+        for controller in self.devices.values():
+            try:
+                await controller.get_cards()
+            except ControllerException as e:
+                logger.error("could not get cards! error =", e)
 
-        # await self.sync_controllers()
+        try:
+            await self.sync_controllers()
+        except Exception as e:
+            logger.error("could not sync controllers! error =", e)
 
         #
         # We can start system health check now
         #
         self.tasks.extend([
-            asyncio.create_task(self._system_health_checker_task()),
-            asyncio.create_task(self._controller_status_poller_task())
+            asyncio.create_task(self._system_health_checker_task(),
+                                name="system_health_check"),
+            asyncio.create_task(self._controller_status_poller_task(),
+                                name="controller_status_poller")
         ])
 
         await asyncio.gather(*self.tasks)
 
-    async def stop(self):
-        self._is_running = False
+    async def shutdown(self):
+        logger.info("shutdown requested")
+        self.stop_event.set()
         for task in self.tasks:
             task.cancel()
-        await asyncio.gather(self.tasks, return_exceptions=True)
-
-    @property
-    def is_running(self) -> bool:
-        return self._is_running
+        await asyncio.gather(*self.tasks, return_exceptions=True)
 
     @property
     def controller_sync_enabled(self) -> bool:
@@ -463,7 +531,7 @@ class IdacUhppotedAdapter:
         return self._mqtt_connected
 
     @property
-    def valid_portal_cards_list(self) -> bool:
+    def is_portal_cards_valid(self) -> bool:
         """whether we have a validated list of cards from the remote portal
         Returns:
             bool: True if portal cards list is known and considered fresh
@@ -483,7 +551,7 @@ class IdacUhppotedAdapter:
         return True
 
     @property
-    def valid_cards(self) -> int:
+    def num_valid_cards(self) -> int:
         """number of valid cards in the cards list
 
         Returns:

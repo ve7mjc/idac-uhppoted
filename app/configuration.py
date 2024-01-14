@@ -1,4 +1,7 @@
-from literals import DEFAULT_UHPPOTED_MQTT_TOPIC_ROOT
+from literals import (
+    DEFAULT_UHPPOTED_MQTT_TOPIC_ROOT,
+    DEFAULT_PORTAL_CARDS_LIST_POLL_SECS
+)
 
 from dataclasses import dataclass, field, is_dataclass
 from typing import Optional, Any, Union, Type, TypeVar
@@ -40,6 +43,7 @@ class UhppoteServerConfiguration:
 class MembershipPortalConfiguration:
     url_get_tokens_list: str
     url_put_token_events: str
+    list_poll_time_secs: float
 
 
 @dataclass
@@ -136,6 +140,9 @@ def get_config() -> Configuration:
         builder.get_key('membership_portal.url_get_tokens_list')
     cfg['membership_portal']['url_put_token_events'] = \
         builder.get_key('membership_portal.url_put_token_events')
+    cfg['membership_portal']['list_poll_time_secs'] = \
+        builder.get_key('membership_portal.list_poll_time_secs',
+                        DEFAULT_PORTAL_CARDS_LIST_POLL_SECS)
 
     cfg['mqtt'] = {}
     cfg['mqtt']['hostname'] = builder.get_key('mqtt.hostname')

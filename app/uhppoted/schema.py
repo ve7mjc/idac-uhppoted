@@ -3,6 +3,14 @@ from dataclasses import dataclass
 import asyncio
 
 
+class ControllerException(Exception):
+    pass
+
+
+class ControllerTimeout(ControllerException):
+    pass
+
+
 @dataclass
 class UhppotedCard:
     code: int
